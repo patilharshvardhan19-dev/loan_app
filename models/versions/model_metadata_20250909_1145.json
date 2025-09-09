@@ -1,0 +1,16 @@
+{
+  "saved_at": "Tue Sep  9 11:45:19 2025",
+  "model_path": "models/xgb_model.joblib",
+  "features": [
+    "fico_score",
+    "dti_computed",
+    "loan_to_income",
+    "annual_inc",
+    "emp_length_years",
+    "has_delinquency",
+    "int_rate",
+    "installment",
+    "grade",
+    "purpose"
+  ]
+}

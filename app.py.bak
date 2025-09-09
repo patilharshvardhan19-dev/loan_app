@@ -1,0 +1,283 @@
+# ~/loan_app/app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os, re
+import joblib
+from xgboost import XGBClassifier
+
+# optional: shap for explanations (may be slow on very large uploads)
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    HAS_SHAP = False
+
+MODEL_PATH = os.path.expanduser("~/loan_app/models/xgb_model.joblib")
+os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+
+st.set_page_config(layout="wide")
+st.title("🏦 Home Loan Credit Risk Assessment (Demo)")
+
+st.write(
+    "Upload a dataset (CSV/XLSX). The app will attempt to train/load a model, predict probabilities, "
+    "and assign each applicant into: **Will Repay**, **Maybe**, or **Will Not Repay**. "
+    "If labels (`loan_status`) exist and there are ≥100 labeled rows, the app trains a model (saved for reuse)."
+)
+
+uploaded_file = st.file_uploader("Upload applicant dataset (CSV / XLS / XLSX)", type=["csv","xls","xlsx"])
+if uploaded_file is None:
+    st.info("Upload your dataset to begin (for example: MOTHERFILE.xlsx).")
+    st.stop()
+
+# ---- load dataframe ----
+try:
+    if str(uploaded_file.name).lower().endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file, sheet_name=0, engine="openpyxl")
+except Exception as e:
+    st.error(f"Failed to read file: {e}")
+    st.stop()
+
+st.write("### Preview of uploaded data (first 5 rows)")
+st.dataframe(df.head())
+
+# ---- helper functions ----
+def safe_parse_emp_length(x):
+    if pd.isna(x): return np.nan
+    s = str(x).lower()
+    if "10" in s and "+" in s: return 10
+    if "<" in s: return 0
+    digits = re.findall(r"\d+", s)
+    return int(digits[0]) if digits else np.nan
+
+def map_status(x):
+    if pd.isna(x): return "Maybe"
+    s = str(x).lower()
+    if "fully paid" in s: return "Will Repay"
+    if "charged off" in s or "default" in s: return "Will Not Repay"
+    if "current" in s or "late" in s or "grace" in s: return "Maybe"
+    return "Maybe"
+
+def clean_feature_matrix(X):
+    # replace inf, clip unrealistic ranges, fill na with medians
+    X = X.copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    if "fico_score" in X.columns:
+        X["fico_score"] = pd.to_numeric(X["fico_score"], errors="coerce").clip(300,850)
+    if "dti_computed" in X.columns:
+        X["dti_computed"] = pd.to_numeric(X["dti_computed"], errors="coerce")
+        X.loc[X["dti_computed"] < 0, "dti_computed"] = np.nan
+        X["dti_computed"] = X["dti_computed"].clip(upper=200)
+    if "loan_to_income" in X.columns:
+        X["loan_to_income"] = pd.to_numeric(X["loan_to_income"], errors="coerce")
+        X.loc[X["loan_to_income"] < 0, "loan_to_income"] = np.nan
+        X["loan_to_income"] = X["loan_to_income"].clip(upper=10)
+    if "annual_inc" in X.columns:
+        X["annual_inc"] = pd.to_numeric(X["annual_inc"], errors="coerce")
+        X.loc[X["annual_inc"] <= 0, "annual_inc"] = np.nan
+        X["annual_inc"] = X["annual_inc"].clip(upper=10_000_000)
+    if "emp_length_years" in X.columns:
+        X["emp_length_years"] = pd.to_numeric(X["emp_length_years"], errors="coerce")
+        X.loc[X["emp_length_years"] < 0, "emp_length_years"] = np.nan
+        X["emp_length_years"] = X["emp_length_years"].clip(lower=0, upper=50)
+    # fill with median
+    X = X.fillna(X.median())
+    return X
+
+def humanize_reason(feat, val):
+    name_map = {
+        "fico_score": "FICO score",
+        "dti_computed": "DTI (debt-to-income)",
+        "loan_to_income": "Loan-to-Income",
+        "annual_inc": "Annual income",
+        "emp_length_years": "Employment length (years)",
+        "has_delinquency": "Past delinquencies",
+        "int_rate": "Interest rate",
+        "installment": "Monthly installment",
+        "grade": "Loan grade",
+        "purpose": "Loan purpose"
+    }
+    pretty = name_map.get(feat, feat.replace("_"," ").title())
+    direction = "increased" if val > 0 else "reduced"
+    mag = abs(val)
+    mag_s = f"{mag:.4f}" if abs(mag) < 1 else f"{mag:.2f}"
+    return f"{pretty} ({mag_s}) {direction} default risk."
+
+# ---- create derived features (non-destructive) ----
+if "fico_range_low" in df.columns and "fico_range_high" in df.columns:
+    df["fico_score"] = (df["fico_range_low"] + df["fico_range_high"]) / 2
+if "dti" in df.columns:
+    df["dti_computed"] = pd.to_numeric(df["dti"], errors="coerce")
+if "loan_amnt" in df.columns and "annual_inc" in df.columns:
+    df["loan_to_income"] = pd.to_numeric(df["loan_amnt"], errors="coerce") / pd.to_numeric(df["annual_inc"], errors="coerce")
+if "emp_length" in df.columns:
+    df["emp_length_years"] = df["emp_length"].apply(safe_parse_emp_length)
+if "delinq_2yrs" in df.columns:
+    df["has_delinquency"] = (pd.to_numeric(df["delinq_2yrs"], errors="coerce") > 0).astype(int)
+
+# ---- prepare features list ----
+features = [c for c in [
+    "fico_score","dti_computed","loan_to_income","annual_inc","emp_length_years",
+    "has_delinquency","int_rate","installment","grade","purpose"
+] if c in df.columns]
+
+st.write(f"Detected features used for modeling: **{features}**")
+
+# ---- prepare target if present ----
+y = None
+df_bin = None
+if "loan_status" in df.columns:
+    df["risk_bucket"] = df["loan_status"].apply(map_status)
+    # only consider explicit Will Repay vs Will Not Repay for training
+    df_bin = df[df["risk_bucket"].isin(["Will Repay","Will Not Repay"])].copy()
+    if len(df_bin) > 0:
+        df_bin["target"] = (df_bin["risk_bucket"] == "Will Not Repay").astype(int)
+        y = df_bin["target"]
+
+# ---- load model if exists (saved previously) ----
+model = None
+if os.path.exists(MODEL_PATH):
+    try:
+        model = joblib.load(MODEL_PATH)
+        st.info("Loaded saved model from disk (will use for predictions).")
+    except Exception as e:
+        st.warning(f"Saved model exists but failed to load: {e}. Will try to train a new model if labels are present.")
+
+# ---- training logic (train only if enough labels OR if no saved model) ----
+trained_here = False
+if model is None and y is not None and len(y) >= 100:
+    st.info("Training a new XGBoost model on uploaded labeled data (≥100 rows). This will be saved for reuse.")
+    # prepare X_bin (features for rows with labels)
+    X_bin = df_bin[features].copy()
+    # encode categories for training
+    for col in ["grade","purpose"]:
+        if col in X_bin.columns:
+            X_bin[col] = X_bin[col].astype("category").cat.codes
+    # clean
+    X_bin = clean_feature_matrix(X_bin)
+    # prepare class weight
+    neg_pos = np.bincount(df_bin["target"])
+    if len(neg_pos) == 1:
+        neg = int(neg_pos[0]); pos = 0
+    else:
+        neg, pos = int(neg_pos[0]), int(neg_pos[1])
+    scale_pos_weight = (neg / pos) if pos > 0 else 1.0
+    # train
+    try:
+        model = XGBClassifier(
+            n_estimators=200, max_depth=6, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
+            scale_pos_weight=scale_pos_weight
+        )
+        model.fit(X_bin, df_bin["target"])
+        # save model
+        joblib.dump(model, MODEL_PATH)
+        trained_here = True
+        st.success("Model trained and saved to models/xgb_model.joblib")
+    except Exception as e:
+        st.error(f"Training failed: {e}")
+        model = None
+
+# ---- If model still None, but saved model exists (maybe failed to load), try safe load again ----
+if model is None and os.path.exists(MODEL_PATH):
+    try:
+        model = joblib.load(MODEL_PATH)
+        st.info("Loaded saved model after training attempt.")
+    except Exception as e:
+        st.warning("Could not load saved model; predictions will be fallback/random.")
+
+# ---- build feature matrix X for prediction ----
+if len(features) == 0:
+    st.error("No modeling features detected in uploaded file. Add expected columns (e.g. annual_inc, loan_amnt, fico_range_low/high, dti, installment).")
+    st.stop()
+
+X = df[features].copy()
+# encode categories in X (same scheme as training: categorical codes)
+for col in ["grade","purpose"]:
+    if col in X.columns:
+        # convert but preserve categories to int codes
+        X[col] = X[col].astype("category").cat.codes
+
+# clean X
+X = clean_feature_matrix(X)
+
+# ---- Predict probabilities ----
+probs = None
+if model is not None:
+    try:
+        probs = model.predict_proba(X)[:,1]
+    except Exception as e:
+        st.warning(f"Model predict failed: {e}. Falling back to random probabilities.")
+        probs = np.random.rand(len(X))
+else:
+    st.warning("No trained model available. Using fallback random probabilities.")
+    probs = np.random.rand(len(X))
+
+# ---- Convert probabilities to buckets (default thresholds, adjustable later) ----
+low_thr = st.sidebar.slider("Low threshold (Will Repay if p < low)", 0.0, 0.5, 0.35, 0.01)
+high_thr = st.sidebar.slider("High threshold (Will Not Repay if p > high)", 0.5, 1.0, 0.65, 0.01)
+
+def assign_bucket(p):
+    if p < low_thr: return "Will Repay"
+    if p > high_thr: return "Will Not Repay"
+    return "Maybe"
+
+pred_bucket = [assign_bucket(p) for p in probs]
+
+# ---- Explanations (SHAP) for up to N rows to avoid long compute ----
+REASON_CAP = 2000
+reason1 = [""] * len(X)
+reason2 = [""] * len(X)
+reason3 = [""] * len(X)
+
+if HAS_SHAP and model is not None:
+    try:
+        n_explain = min(REASON_CAP, len(X))
+        X_explain = X.iloc[:n_explain]
+        explainer = shap.TreeExplainer(model)
+        # compute shap_values (may be memory heavy)
+        shap_vals = explainer.shap_values(X_explain)
+        # shap_values shape: (n_samples, n_features)
+        for i in range(n_explain):
+            arr = shap_vals[i]
+            idxs = np.argsort(-np.abs(arr))[:3]
+            for j, idx in enumerate(idxs):
+                feat = X_explain.columns[idx]
+                val = float(arr[idx])
+                if j==0: reason1[i] = humanize_reason(feat, val)
+                if j==1: reason2[i] = humanize_reason(feat, val)
+                if j==2: reason3[i] = humanize_reason(feat, val)
+    except Exception as e:
+        st.warning(f"SHAP explanation failed or too slow: {e}. Explanations skipped.")
+        # reasons remain blank
+else:
+    if not HAS_SHAP:
+        st.info("SHAP not installed — explanations are disabled. To enable, install the `shap` package in the virtualenv.")
+
+# ---- prepare results dataframe and show ----
+results = df.copy()
+results["pred_proba"] = probs
+results["pred_bucket"] = pred_bucket
+results["reason1"] = reason1
+results["reason2"] = reason2
+results["reason3"] = reason3
+results["combined_reason"] = results[["reason1","reason2","reason3"]].fillna("").agg(" ".join, axis=1).str.strip()
+
+st.write("### Predictions summary")
+st.write(results["pred_bucket"].value_counts())
+
+st.write("### Sample predictions (first 20 rows)")
+st.dataframe(results[["pred_proba","pred_bucket","combined_reason"]].head(20))
+
+# ---- allow download of full results ----
+csv_out = results.to_csv(index=False).encode("utf-8")
+st.download_button("Download full predictions CSV", data=csv_out, file_name="predictions.csv", mime="text/csv")
+
+st.markdown("---")
+st.write("Notes:")
+st.write("- The app trains only when there are ≥100 labeled rows (loan_status) to avoid overfitting small labeled sets.")
+st.write("- If a saved model exists in `~/loan_app/models/xgb_model.joblib`, the app will try to load it and use it to predict.")
+st.write("- SHAP explanations are computed for up to 2000 rows (cap can be changed). SHAP can be slow — if you want full explanations for all 65k rows, run the offline script we used earlier.")
+
