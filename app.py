@@ -33,8 +33,8 @@ os.makedirs(OUTPUTS_DIR, exist_ok=True)
 MODEL_PATH = os.path.join(MODELS_DIR, "xgb_model.joblib")
 EXPORT_ZIP = os.path.join(BASE, "final_submission.zip")
 
-st.set_page_config(layout="wide")
-st.title("🏦 Home Loan Credit Risk Assessment — Full (Dashboard + Passworded Actions)")
+st.set_page_config(page_title="Credit Risk Assessment for Decision Making", layout="wide")
+st.title("🏦 Credit Risk Assessment for Decision Making — Full (Dashboard + Passworded Actions)")
 
 # ---------------- Sidebar controls & admin password ----------------
 st.sidebar.header("Controls")
